@@ -1,9 +1,12 @@
+use async_fs::File;
 use binrw::BinRead;
+use futures_lite::io::{SeekFrom, Take};
+use futures_lite::{ready, AsyncRead, AsyncReadExt, AsyncSeekExt, FutureExt};
 use std::borrow::Cow;
-use std::fs::File;
-use std::io::{Error, Read, Seek, SeekFrom};
+use std::io::{Error, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::task::Poll;
 
 /// An entry in the VPK.
 #[derive(Debug)]
@@ -25,26 +28,25 @@ pub struct VPKEntry {
 
 impl VPKEntry {
     /// Get the data of the [`VPKEntry`].
-    pub fn get(&self) -> Result<Cow<[u8]>, Error> {
-        let mut reader = self.reader()?;
+    pub async fn get(&self) -> Result<Cow<[u8]>, Error> {
+        let mut reader = self.reader().await?;
         let mut buf = Vec::new();
-        reader.read_to_end(&mut buf)?;
+        reader.read_to_end(&mut buf).await?;
         Ok(Cow::from(buf))
     }
 
     /// Create a [`VPKEntryReader`].
-    pub fn reader(&self) -> Result<VPKEntryReader<'_>, Error> {
-        let file = self
-            .archive_path
-            .as_ref()
-            .map(|archive_path| {
-                let mut file = File::open(archive_path.as_path())?;
-                file.seek(SeekFrom::Start(self.dir_entry.archive_offset as u64))?;
-                Ok::<_, Error>(file.take(self.dir_entry.file_length as u64))
-            })
-            .transpose()?;
+    pub async fn reader(&self) -> Result<VPKEntryReader<'_>, Error> {
+        let Some(path) = self.archive_path.as_ref() else {
+            return Ok(VPKEntryReader::new(&self.preload_data, None));
+        };
 
-        Ok(VPKEntryReader::new(&self.preload_data, file))
+        let mut file = File::open(path.as_path()).await?;
+        file.seek(SeekFrom::Start(self.dir_entry.archive_offset as u64))
+            .await?;
+        let file = file.take(self.dir_entry.file_length as u64);
+
+        Ok(VPKEntryReader::new(&self.preload_data, Some(file)))
     }
 }
 
@@ -63,16 +65,22 @@ pub enum VPKEntryReader<'a> {
         /// Preloaded data.
         preloaded_data: std::io::Cursor<&'a [u8]>,
         /// The file that must be read.
-        file: std::io::Take<File>,
+        file: Take<File>,
     },
     /// Only the file must be read.
-    FileOnly { file: std::io::Take<File> },
+    FileOnly { file: Take<File> },
 }
 
-impl Read for VPKEntryReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            VPKEntryReader::PreloadedOnly { preloaded_data } => preloaded_data.read(buf),
+impl AsyncRead for VPKEntryReader<'_> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            VPKEntryReader::PreloadedOnly { preloaded_data } => {
+                Poll::Ready(preloaded_data.read(buf))
+            }
             VPKEntryReader::PreloadAndFile {
                 preloaded_data_len,
                 preloaded_bytes_read,
@@ -80,12 +88,13 @@ impl Read for VPKEntryReader<'_> {
                 file,
             } => {
                 if preloaded_bytes_read >= preloaded_data_len {
-                    file.read(buf)
+                    let res = ready!(file.read(buf).poll(cx));
+                    Poll::Ready(res)
                 } else {
                     let bytes_read = preloaded_data.read(buf)?;
 
                     let bytes_read = if bytes_read < buf.len() {
-                        let file_bytes_read = file.read(&mut buf[bytes_read..])?;
+                        let file_bytes_read = ready!(file.read(&mut buf[bytes_read..]).poll(cx))?;
                         bytes_read + file_bytes_read
                     } else {
                         bytes_read
@@ -93,17 +102,20 @@ impl Read for VPKEntryReader<'_> {
 
                     *preloaded_bytes_read += bytes_read;
 
-                    Ok(bytes_read)
+                    Poll::Ready(Ok(bytes_read))
                 }
             }
-            VPKEntryReader::FileOnly { file } => file.read(buf),
+            VPKEntryReader::FileOnly { file } => {
+                let bytes_read = ready!(file.read(buf).poll(cx));
+                Poll::Ready(bytes_read)
+            }
         }
     }
 }
 
 impl<'a> VPKEntryReader<'a> {
     /// Create a new [`VPKEntryReader`].
-    pub fn new(preloaded_data: &'a [u8], file: Option<std::io::Take<File>>) -> Self {
+    pub fn new(preloaded_data: &'a [u8], file: Option<Take<File>>) -> Self {
         match file {
             Some(file) => {
                 if preloaded_data.is_empty() {

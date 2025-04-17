@@ -12,6 +12,8 @@ rust-version = "1.66"
 thiserror = "2.0.12"
 binrw = "0.14.1"
 ahash = "0.8.11"
+async-fs = "2.1"
+futures-lite = "2.6"
 
 [dev-dependencies]
 iai = "0.1.1"
