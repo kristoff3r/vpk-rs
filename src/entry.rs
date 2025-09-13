@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// An entry in the VPK.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct VPKEntry {
     /// [`VPKDirectoryEntry`].
     pub dir_entry: VPKDirectoryEntry,
@@ -127,7 +127,7 @@ impl<'a> VPKEntryReader<'a> {
 /// [`VPKEntry`] header.
 ///
 /// Information about the entry stored in the root VPK.
-#[derive(Debug, BinRead)]
+#[derive(Clone, Debug, BinRead)]
 pub struct VPKDirectoryEntry {
     /// 32 bit CRC.
     pub crc32: u32,
